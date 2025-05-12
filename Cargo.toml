@@ -4,7 +4,7 @@ description = "Firmware for Lil-G's Motion Control"
 edition = "2021"
 license = "MIT"
 name = "lil-g-firmware"
-repository = "https://github.com/rp-rs/rp-hal"
+repository = "https://github.com/Lil-G-Robot/firmware"
 rust-version = "1.81"
 version = "0.1.0"
 
