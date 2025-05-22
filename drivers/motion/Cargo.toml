@@ -1,0 +1,17 @@
+[package]
+name = "motion-control"
+description = "Driver for Lil-G's motion control"
+authors = ["celcius-plus-273"]
+edition = "2021"
+version = "0.1.0"
+
+# import embedded hal
+[dependencies]
+embedded-hal = "~1.0"
+rp235x-hal = "0.3.0"
+icm20948_driver = "0.2.0"
+defmt = "0.3"
+
+[dependencies.motor-driver]
+path = "../motor"
+features = ["rp235x"]

@@ -1,0 +1,15 @@
+[package]
+name = "motor-driver"
+description = "Driver for Lil-G's Motor Driving System based on Allegro's A4950E DMOS full-bridge brushed DC driver IC"
+authors = ["celcius-plus-273"]
+edition = "2021"
+version = "0.1.0"
+
+[features]
+rp235x = []
+
+# import embedded hal
+[dependencies]
+embedded-hal = "~1.0"
+rp235x-hal = "0.3.0"
+defmt = "1"
