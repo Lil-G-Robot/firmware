@@ -9,8 +9,14 @@ version = "0.1.0"
 [dependencies]
 embedded-hal = "~1.0"
 rp235x-hal = "0.3.0"
-icm20948_driver = "0.2.0"
+# icm20948_driver = "0.2.0"
+lsm6dso = "0.2.1"
 defmt = "0.3"
+# nalgebra = {version = "0.33.2", features = ["no-std"]}
+[dependencies.nalgebra]
+version = "0.33.0"
+default-features = false
+features = ["libm", "nalgebra-macros"]
 
 [dependencies.motor-driver]
 path = "../motor"

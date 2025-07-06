@@ -24,7 +24,13 @@ rp235x-hal = {version = "0.3.0", features = ["binary-info", "critical-section-im
 rp-binary-info = "0.1.1"
 
 # IMU driver
-icm20948_driver = "0.2.0"
+# icm20948_driver = "0.2.0"
+lsm6dso = "0.2.1"
+
+[dependencies.nalgebra]
+version = "0.33.0"
+default-features = false
+features = ["libm", "nalgebra-macros"]
 
 [dependencies.rtic]
 version = "2.0.0"

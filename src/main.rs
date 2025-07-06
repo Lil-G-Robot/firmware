@@ -31,7 +31,7 @@ use hal::{
 };
 
 // temporary will remove after types are moved to respective file
-use rp235x_hal::pwm::{self, Channel, FreeRunning, Pwm4, Slice};
+use rp235x_hal::pwm::{self, Channel, FreeRunning, Pwm4, Pwm5, Slice};
 
 // import local drivers
 use motor_driver::*;
@@ -39,9 +39,13 @@ use motor::Motor;
 use rp235x_pkg::*;
 use motion_control::motion;
 use motion::{Motion, RotDirection, MoveDirection};
+mod status;
+use status::Status;
 
 // IMU driver
-use icm20948_driver::icm20948;
+// use icm20948_driver::icm20948;
+use lsm6dso::Lsm6dso;
+use nalgebra::base::*;
 
 // Some things we need
 // use embedded_hal::delay::DelayNs;
@@ -77,13 +81,15 @@ mod app {
     struct Shared {
         // motor instance
         m: Motion,
+        // shared timer
+        timer: MotionTimer,
     }
 
     // local variables
     #[local]
     struct Local {
         // do a single LED for now
-        led: Channel<Slice<Pwm4, FreeRunning>, pwm::B>,
+        status: Status,
    }
 
     #[init]
@@ -115,17 +121,20 @@ mod app {
         );
 
         // Debug print
-        info!("Initializing peripherals");
+        info!("Initializing...");
 
         // timer 1
         let mut timer = hal::Timer::new_timer1(ctx.device.TIMER1, &mut ctx.device.RESETS, &clocks);
         timer.delay_ms(200);
 
+        ///////////////
+        // IMU Setup //
+        ///////////////
         // I2C
-        let sda_pin = pins.gpio12.reconfigure();
-        let scl_pin = pins.gpio13.reconfigure();
-        let i2c = hal::I2C::i2c0(
-            ctx.device.I2C0,
+        let sda_pin = pins.gpio2.reconfigure();
+        let scl_pin = pins.gpio3.reconfigure();
+        let i2c = hal::I2C::i2c1(
+            ctx.device.I2C1,
             sda_pin,
             scl_pin,
             400.kHz(),
@@ -133,127 +142,117 @@ mod app {
             &clocks.system_clock,
         );
 
-        // setting up IMU
-        info!("Setting up IMU");
-        let mut imu = icm20948::i2c::IcmImu::new(i2c, 0x69).unwrap();
+        // imu instance
+        let mut imu = Lsm6dso::new(i2c, 0x6A);
 
-        let wai = imu.wai().unwrap();
-        info!("Who Am I?: {}", wai);
+        // acceleromter setup
+        imu.set_accelerometer_output(lsm6dso::AccelerometerOutput::Rate833).unwrap();
+        imu.set_accelerometer_scale(lsm6dso::AccelerometerScale::G02).unwrap();
+        imu.set_accelerometer_low_pass(Some(lsm6dso::Bandwidth::OdrDiv10)).unwrap();
 
-        imu.set_gyro_sen(icm20948::GyroSensitivity::Sen500dps).unwrap();
-        imu.set_acc_sen(icm20948::AccSensitivity::Sen4g).unwrap();
+        // gyro setup
+        imu.set_gyroscope_output(lsm6dso::GyroscopeOutput::Rate833).unwrap();
+        imu.set_gyroscope_scale(lsm6dso::GyroscopeFullScale::Dps125).unwrap();
 
+        // make sure we can communicate with IMU
+        match imu.check() {
+            Ok(_) => info!("[INFO] IMU Initialized correctly"),
+            Err(_) => info!("[ERROR] Cannot initialized IMU")
+        };
+
+        /////////////////
+        // Status LEDs //
+        /////////////////
+        let led_1 = pins.gpio11.into_push_pull_output();
+        let led_2 = pins.gpio10.into_push_pull_output();
+        let led_3 = pins.gpio9.into_push_pull_output();
+        let led_4 = pins.gpio8.into_push_pull_output();
+        let mut status = Status::new(led_1, led_2, led_3, led_4);
+        status.reset_all();
+
+        //////////////////////////////
+        // Configure Motor PWM Pins //
+        //////////////////////////////
         // Init PWMs
         let pwm_slices = hal::pwm::Slices::new(ctx.device.PWM, &mut ctx.device.RESETS);
-
-        // Configure led as PWM 4b
-        let mut pwm4 = pwm_slices.pwm4; // take pwm4
-        pwm4.set_ph_correct();
-        pwm4.enable();
-        let mut led = pwm4.channel_b; // take channel_b
-        led.output_to(pins.gpio25);
-
-        // Configure Motor PWM Pins //
         // Motor 1
-        let mut pwm0 = pwm_slices.pwm0;
-        pwm0.set_ph_correct();
-        pwm0.enable();
-        let mut m1_pwm_a = pwm0.channel_b;
-        let mut m1_pwm_b = pwm0.channel_a;
-        m1_pwm_a.output_to(pins.gpio17);
-        m1_pwm_b.output_to(pins.gpio16);
-        m1_pwm_a.set_inverted();
-        m1_pwm_b.set_inverted();
+        let m1_pwm = pwm_slices.pwm4;
+        let m1_pin_a = pins.gpio24;
+        let m1_pin_b = pins.gpio25;
 
         // Motor 2
-        let mut pwm5 = pwm_slices.pwm5;
-        let mut pwm2 = pwm_slices.pwm2;
-        pwm5.set_ph_correct();
-        pwm2.set_ph_correct();
-        pwm5.enable();
-        pwm2.enable();
-        let mut m2_pwm_a = pwm2.channel_a;
-        let mut m2_pwm_b = pwm5.channel_a;
-        m2_pwm_a.output_to(pins.gpio4);
-        m2_pwm_b.output_to(pins.gpio26);
-        m2_pwm_a.set_inverted();
-        m2_pwm_b.set_inverted();
+        let m2_pwm = pwm_slices.pwm2;
+        let m2_pin_a = pins.gpio20;
+        let m2_pin_b = pins.gpio21;
 
         // Motor 3
-        let mut pwm1 = pwm_slices.pwm1;
-        let mut pwm7 = pwm_slices.pwm7;
-        pwm1.set_ph_correct();
-        pwm7.set_ph_correct();
-        pwm1.enable();
-        pwm7.enable();
-        let mut m3_pwm_a = pwm7.channel_a;
-        let mut m3_pwm_b = pwm1.channel_b;
-        m3_pwm_a.output_to(pins.gpio14);
-        m3_pwm_b.output_to(pins.gpio19);
-        m3_pwm_a.set_inverted();
-        m3_pwm_b.set_inverted();
+        let m3_pwm = pwm_slices.pwm0;
+        let m3_pin_a = pins.gpio16;
+        let m3_pin_b = pins.gpio17;
 
         // Motor 4
-        let mut m4_pwm_a = pwm1.channel_a;
-        let mut m4_pwm_b = pwm7.channel_b;
-        m4_pwm_a.output_to(pins.gpio18);
-        m4_pwm_b.output_to(pins.gpio15);
-        m4_pwm_a.set_inverted();
-        m4_pwm_b.set_inverted();
+        let m4_pwm = pwm_slices.pwm6;
+        let m4_pin_a = pins.gpio12;
+        let m4_pin_b = pins.gpio13;
 
+        //////////////////////////////////
         // Configure Motor Encoder Pins //
+        //////////////////////////////////
         // Motor 1
-        let m1_enc_a = pins.gpio22.into_pull_down_input();
-        let m1_enc_b = pins.gpio21.into_pull_down_input();
+        let m1_enc_a = pins.gpio26.into_pull_down_input();
+        let m1_enc_b = pins.gpio27.into_pull_down_input();
         m1_enc_a.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m1_enc_a.set_interrupt_enabled(Interrupt::EdgeLow, true);
         m1_enc_b.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m1_enc_b.set_interrupt_enabled(Interrupt::EdgeLow, true);
 
         // Motor 2
-        let m2_enc_a = pins.gpio1.into_pull_down_input();
-        let m2_enc_b = pins.gpio0.into_pull_down_input();
+        let m2_enc_a = pins.gpio22.into_pull_down_input();
+        let m2_enc_b = pins.gpio23.into_pull_down_input();
         m2_enc_a.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m2_enc_a.set_interrupt_enabled(Interrupt::EdgeLow, true);
         m2_enc_b.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m2_enc_b.set_interrupt_enabled(Interrupt::EdgeLow, true);
 
         // Motor 3
-        let m3_enc_a = pins.gpio2.into_pull_down_input();
-        let m3_enc_b = pins.gpio28.into_pull_down_input();
+        let m3_enc_a = pins.gpio18.into_pull_down_input();
+        let m3_enc_b = pins.gpio19.into_pull_down_input();
         m3_enc_a.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m3_enc_a.set_interrupt_enabled(Interrupt::EdgeLow, true);
         m3_enc_b.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m3_enc_b.set_interrupt_enabled(Interrupt::EdgeLow, true);
 
         // Motor 4
-        let m4_enc_a = pins.gpio3.into_pull_down_input();
-        let m4_enc_b = pins.gpio27.into_pull_down_input();
+        let m4_enc_a = pins.gpio14.into_pull_down_input();
+        let m4_enc_b = pins.gpio15.into_pull_down_input();
         m4_enc_a.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m4_enc_a.set_interrupt_enabled(Interrupt::EdgeLow, true);
         m4_enc_b.set_interrupt_enabled(Interrupt::EdgeHigh, true);
         m4_enc_b.set_interrupt_enabled(Interrupt::EdgeLow, true);
 
         // instantiate motors
-        let m1 = Motor::new(m1_pwm_a, m1_pwm_b, m1_enc_a, m1_enc_b).configure();
-        let m2 = Motor::new(m2_pwm_a, m2_pwm_b, m2_enc_a, m2_enc_b).configure();
-        let m3 = Motor::new(m3_pwm_a, m3_pwm_b, m3_enc_a, m3_enc_b).configure();
-        let m4 = Motor::new(m4_pwm_a, m4_pwm_b, m4_enc_a, m4_enc_b).configure();
+        let m1 = Motor::new(m1_pwm, m1_enc_a, m1_enc_b).configure(m1_pin_a, m1_pin_b);
+        let m2 = Motor::new(m2_pwm, m2_enc_a, m2_enc_b).configure(m2_pin_a, m2_pin_b);
+        let m3 = Motor::new(m3_pwm, m3_enc_a, m3_enc_b).configure(m3_pin_a, m3_pin_b);
+        let m4 = Motor::new(m4_pwm, m4_enc_a, m4_enc_b).configure(m4_pin_a, m4_pin_b);
 
-        // motion control instance
-        let mut m = Motion::new(m1, m2, m3, m4, imu, timer);
+        ////////////////////
+        // Motion Control //
+        ////////////////////
+        let mut m = Motion::new(m1, m2, m3, m4, imu, &timer);
         m.configure(); // set some defaults
  
         // spawn heartbeat task (blinky)
         heartbeat::spawn().ok();
 
-        spin::spawn().ok();
+        basic_move::spawn().ok();
+        // complex_move::spawn().ok();
         setpoint::spawn().ok();
         // printEnc::spawn().ok();
         // imu_test::spawn().ok();
 
         // return resources and timer
-        (Shared {m}, Local {led})
+        (Shared {m, timer}, Local {status})
 
     }
 
@@ -295,7 +294,7 @@ mod app {
     }
 
     #[task(shared = [m], priority = 1)]
-    async fn spin(ctx: spin::Context) {
+    async fn basic_move(ctx: basic_move::Context) {
         let mut m = ctx.shared.m;
         let speed: f32 = 20.0;
         let fast = 30.0;
@@ -306,45 +305,68 @@ mod app {
 
         loop {
             m.lock(|m| {
-                m.move_in_dir_speed_diag(speed, MoveDirection::Forward);
+                m.move_body_to_wheel(Vector3::new(0.0, speed, 0.0));
             });
             Mono::delay(5000.millis()).await;
 
             // right
             m.lock(|m| {
-                m.move_in_dir_speed_diag(speed, MoveDirection::Right);
+                m.move_body_to_wheel(Vector3::new(speed, 0.0, 0.0));
             });
             Mono::delay(5000.millis()).await;
 
             // backward
             m.lock(|m| {
-                m.move_in_dir_speed_diag(speed, MoveDirection::Backward);
+                m.move_body_to_wheel(Vector3::new(0.0, -speed, 0.0));
             });
             Mono::delay(5000.millis()).await;
 
-            // backward
+            // left
             m.lock(|m| {
-                m.move_in_dir_speed_diag(speed, MoveDirection::Left);
-            });
-            Mono::delay(5000.millis()).await;
-
-            m.lock(|m| {
-                m.rotate_in_dir_speed(speed, RotDirection::CW);
+                m.move_body_to_wheel(Vector3::new(-speed, 0.0, 0.0));
             });
             Mono::delay(5000.millis()).await;
 
             m.lock(|m| {
-                m.rotate_in_dir_speed(fast, RotDirection::CW);
+                m.move_body_to_wheel(Vector3::new(0.0, 0.0, -speed/5.0));
             });
             Mono::delay(5000.millis()).await;
 
             m.lock(|m| {
-                m.rotate_in_dir_speed(speed, RotDirection::CCW);
+                m.move_body_to_wheel(Vector3::new(0.0, 0.0, -fast/5.0));
             });
             Mono::delay(5000.millis()).await;
 
             m.lock(|m| {
-                m.rotate_in_dir_speed(fast, RotDirection::CCW);
+                m.move_body_to_wheel(Vector3::new(0.0, 0.0, speed/5.0));
+            });
+            Mono::delay(5000.millis()).await;
+
+            m.lock(|m| {
+                m.move_body_to_wheel(Vector3::new(0.0, 0.0, fast/5.0));
+            });
+            Mono::delay(5000.millis()).await;
+        }
+    }
+
+    #[task(shared = [m], priority = 1)]
+    async fn complex_move(ctx: complex_move::Context) {
+        let mut m = ctx.shared.m;
+        let speed = 20.0f32;
+
+        loop {
+            m.lock(|m| {
+                m.move_body_to_wheel(Vector3::new(speed/2.0, speed/2.0, 0.0));
+            });
+            Mono::delay(5000.millis()).await;
+
+            m.lock(|m| {
+                m.move_body_to_wheel(Vector3::new(speed, 0.0, speed/10.0));
+            });
+            Mono::delay(5000.millis()).await;
+
+            m.lock(|m| {
+                m.move_body_to_wheel(Vector3::new(0.0, speed/2.0, speed/5.0));
             });
             Mono::delay(5000.millis()).await;
         }
@@ -357,21 +379,24 @@ mod app {
         loop {
             m.lock(|m| {
                 m.test_gyro();
+                m.test_accel();
+                m.test_temp();
             });
             Mono::delay(50.millis()).await;
         }
     }
 
-    #[task(shared = [m], priority = 2)]
+    #[task(shared = [m, timer], priority = 2)]
     async fn setpoint(ctx: setpoint::Context) {
         let mut m = ctx.shared.m;
+        let mut timer = ctx.shared.timer;
 
         loop {
             // forward
-            m.lock(|m| {
-                m.poll_all_setpoints(0.05);
+            (&mut m, &mut timer).lock(|m, timer| {
+                m.poll_all_setpoints(0.2, &timer);
             });
-            Mono::delay(50.millis()).await;
+            Mono::delay(200.millis()).await;
        }
     }
 
@@ -388,15 +413,15 @@ mod app {
         });
     }
 
-    #[task(local = [led], priority = 1)]
+    #[task(local = [status], priority = 1)]
     async fn heartbeat(ctx: heartbeat::Context) {
-        let led = ctx.local.led;
+        let status = ctx.local.status;
 
         // read encoder input and set led vaue accordingly
         loop {
-            led.set_duty_cycle(led.max_duty_cycle()).unwrap();
+            status.set_all();
             Mono::delay(500.millis()).await;
-            led.set_duty_cycle(0).unwrap();
+            status.reset_all();
             Mono::delay(500.millis()).await;
         }
     }

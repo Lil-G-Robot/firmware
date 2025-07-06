@@ -3,13 +3,22 @@
 use core::f32::consts::{SQRT_2, PI};
 
 use motor_driver::*;
-use motor::{Motor, WheelRotDir};
-use icm20948_driver::icm20948::i2c::IcmImu;
+use motor::{Motor, WheelRotDir, WHEEL_DIAMETER};
+// use icm20948_driver::icm20948::i2c::IcmImu;
+use lsm6dso::Lsm6dso;
 use rp235x_hal::{
-        fugit::Duration, gpio::Interrupt, timer::Instant
+        fugit::Duration, gpio::Interrupt,
+        pwm::{FreeRunning, Pwm4, Pwm0, Pwm2, Pwm6},
+        timer::Instant
     };
 use rp235x_pkg::*; // ensures pins are right
 use defmt::info;
+
+// linear algebra lib
+use nalgebra::base::*;
+
+// distance from center of body to center of wheel
+const D_LENGTH: f32 = 5.0;
 
 // enum for directions
 #[derive(Debug)]
@@ -35,39 +44,55 @@ pub enum MotorNum {
 
 pub struct Motion {
     // motor instances
-    m1: Motor<M1PwmA, M1PwmB, M1EncA, M1EncB>,
-    m2: Motor<M2PwmA, M2PwmB, M2EncA, M2EncB>,
-    m3: Motor<M3PwmA, M3PwmB, M3EncA, M3EncB>,
-    m4: Motor<M4PwmA, M4PwmB, M4EncA, M4EncB>,
+    m1: Motor<Pwm4, FreeRunning, M1EncA, M1EncB>,
+    m2: Motor<Pwm2, FreeRunning, M2EncA, M2EncB>,
+    m3: Motor<Pwm0, FreeRunning, M3EncA, M3EncB>,
+    m4: Motor<Pwm6, FreeRunning, M4EncA, M4EncB>,
 
     // add imu instance
-    imu: IcmImu<ImuI2C>,
+    // imu: IcmImu<ImuI2C>,
+    imu: Lsm6dso<ImuI2C>,
 
     // timer for instants
-    timer: MotionTimer,
+    // timer: MotionTimer,
 
     // add motion control state variables
     last_timer_count: Instant,
+
+    // motion control
+    body_to_wheel: Matrix4x3<f32>,
+    wheel_to_body: Matrix3x4<f32>,
 }
 
 impl Motion {
     pub fn new (
-                m1: Motor<M1PwmA, M1PwmB, M1EncA, M1EncB>,
-                m2: Motor<M2PwmA, M2PwmB, M2EncA, M2EncB>,
-                m3: Motor<M3PwmA, M3PwmB, M3EncA, M3EncB>,
-                m4: Motor<M4PwmA, M4PwmB, M4EncA, M4EncB>,
-                imu: IcmImu<ImuI2C>,
-                timer: MotionTimer,
+        m1: Motor<Pwm4, FreeRunning, M1EncA, M1EncB>,
+        m2: Motor<Pwm2, FreeRunning, M2EncA, M2EncB>,
+        m3: Motor<Pwm0, FreeRunning, M3EncA, M3EncB>,
+        m4: Motor<Pwm6, FreeRunning, M4EncA, M4EncB>,
+        imu: Lsm6dso<ImuI2C>,
+        timer: &MotionTimer,
     ) -> Self {
+        // why do we divide by wheel raidus??
+        let b_to_w = (2.0 / WHEEL_DIAMETER) * Matrix4x3::new(
+            -(SQRT_2 / 2.0),    -(SQRT_2/ 2.0),   D_LENGTH,
+            -(SQRT_2 / 2.0),    (SQRT_2/ 2.0),    D_LENGTH,
+            (SQRT_2 / 2.0),     (SQRT_2/ 2.0),    D_LENGTH,
+            (SQRT_2 / 2.0),     -(SQRT_2/ 2.0),   D_LENGTH);
+
+        // is this right...??
+        let w_to_b = b_to_w.transpose();
+
         Motion {
             // motors
             m1, m2, m3, m4,
             // imu instance
             imu,
-            //timer
-            timer,
             // get initial timer instant count
             last_timer_count: timer.get_counter(),
+            // conversion matrices
+            body_to_wheel: b_to_w,
+            wheel_to_body: w_to_b,
         }
     }
 
@@ -189,6 +214,21 @@ impl Motion {
         }
     }
 
+    // moves the robot based on the passed in velocity described as:
+    // v = [x, y, w]
+    pub fn move_body_to_wheel(&mut self, speed: Vector3<f32>) {
+        // compute wheel velocity vector
+        let wheel_u = self.body_to_wheel * speed;
+
+        // log the output for now...
+        info!("Wheel velocities: {}, {}, {}, {}", wheel_u[0], wheel_u[1], wheel_u[2], wheel_u[3]);
+
+        self.m1.set_speed_setpoint(wheel_u[0]);
+        self.m2.set_speed_setpoint(wheel_u[1]);
+        self.m3.set_speed_setpoint(wheel_u[2]);
+        self.m4.set_speed_setpoint(wheel_u[3]);
+    }
+
     pub fn stop_all_motors(&mut self) {
         self.m1.stop();
         self.m2.stop();
@@ -213,8 +253,8 @@ impl Motion {
         }
     }
 
-    pub fn poll_all_setpoints(&mut self, backup_delta: f32) {
-        let new_instant = self.timer.get_counter();
+    pub fn poll_all_setpoints(&mut self, backup_delta: f32, timer: &MotionTimer) {
+        let new_instant = timer.get_counter();
         let delta = match new_instant.checked_duration_since(self.last_timer_count) {
             Some(duration) => {(duration.to_micros() as f32) / 1_000_000.0},
             None => {
@@ -225,15 +265,19 @@ impl Motion {
         self.last_timer_count = new_instant;
 
         // info!("Got delta: {} s", delta);
-        self.m1.update_duty_to_setpoint(delta);
-        self.m2.update_duty_to_setpoint(delta);
-        self.m3.update_duty_to_setpoint(delta);
-        self.m4.update_duty_to_setpoint(delta);
+        let mut wheel_u = Vector4::new(0.0, 0.0, 0.0, 0.0);
+        wheel_u[0] = self.m1.update_duty_to_setpoint(delta);
+        wheel_u[1] = self.m2.update_duty_to_setpoint(delta);
+        wheel_u[2] = self.m3.update_duty_to_setpoint(delta);
+        wheel_u[3] = self.m4.update_duty_to_setpoint(delta);
+
+        // try printing this back :)
+        let body_v = self.wheel_to_body * wheel_u;
+        info!("Robot is moving: ({}, {}, {})", body_v[0], body_v[1], body_v[2]);
     }
 
     pub fn update_encoder_tick_all_motors(&mut self) {
-        // check for interrupt flags on encoders and update if
-        // tripped
+        // check for interrupt flags on encoders and update if tripped
         if self.m1.enc_a.interrupt_status(Interrupt::EdgeHigh) | self.m1.enc_a.interrupt_status(Interrupt::EdgeLow) {
             self.update_encoder_tick(MotorNum::M1);
         }
@@ -348,10 +392,18 @@ impl Motion {
 
     pub fn test_gyro(&mut self) {
         // simply read the gyro and classify the rotational speed detected
-        let enc_data = self.imu.read_gyro_z().unwrap();
+        let enc_data = self.imu.read_gyro().unwrap();
 
         // for now just print the speed
-        info!("Enc Z: {}", enc_data);
+        info!("Enc Z: {}", enc_data.2);
         // now print something based on the speed
+    }
+     pub fn test_accel(&mut self) {
+        let accel_data = self.imu.read_accelerometer().unwrap();
+        info!("Accel (X, Y): ({}, {})", accel_data.0, accel_data.1);
+    }
+    pub fn test_temp(&mut self) {
+        let temp_data = self.imu.read_temperature().unwrap();
+        info!("Temp: {}", temp_data);
     }
 }

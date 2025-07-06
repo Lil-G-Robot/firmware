@@ -9,14 +9,18 @@ use core::f32::consts::PI;
 use embedded_hal::digital::InputPin;
 use embedded_hal::pwm::SetDutyCycle;
 
+use rp235x_hal::gpio::AnyPin;
 // rp235x structs and traits
-use defmt::info;
+// use defmt::info;
+use rp235x_hal::pwm::{Slice, SliceId, ValidSliceMode};
+use rp235x_hal::pwm::{ValidPwmOutputPin, A, B};
 
 // constants
-const TICKS_PER_ROTATION: f32 = 12.0;
-const WHEEL_DIAMETER: f32 = 6.0; // 60 mm => 6 cm
-const MOTOR_GEAR_RATIO: f32 = 29.86;
-const SPEED_HISTORY_LENGTH: usize = 2;
+pub const TICKS_PER_ROTATION: f32 = 12.0;   // encoder ticks
+pub const WHEEL_DIAMETER: f32 = 6.0;        // 60 mm => 6 cm
+pub const MOTOR_GEAR_RATIO: f32 = 29.86;    // pololu motors gr
+
+const SPEED_HISTORY_LENGTH: usize = 2;  // number of recorded speed samples
 const CORRECTION_FACTOR_DIFF: f32 = 1.5;
 const CORRECTION_OFFSET: u16 = 10;
 const MAX_ALLOWED_DUTY: u16 = 40_000;
@@ -98,7 +102,7 @@ pub(crate) fn get_correction_factor(curr_speed:&f32, new_speed: &f32) -> f32 {
         difference = -difference;
     }
 
-    // correction factor returns 10& correction if our difference is 1 cm/s
+    // correction factor returns  correction if our difference is 1 cm/s
     // consider changing this function to be non-linear
     let mut correction = difference * CORRECTION_FACTOR_DIFF;
     if correction > 50.0 {
@@ -130,18 +134,17 @@ pub(crate) fn get_updated_duty(curr: u16, correction: f32) -> u16 {
 ///
 /// Structure that represents an instance of a Motor Driver.
 ///
-/// Based on Allegro's A4950E DMOS full-bridge brushed DC motor driver IC.
+/// For Allegro's A4950E DMOS full-bridge brushed DC motor driver IC.
 ///
-pub struct Motor <C1, C2, E1, E2>
+pub struct Motor <I, M, E1, E2>
 where
-    C1: SetDutyCycle,    // pwm channel
-    C2: SetDutyCycle,    // pwm channel
-    E1: InputPin,        // input pin
-    E2: InputPin,        // input pin
+    I: SliceId,             // channel ID
+    M: ValidSliceMode<I>,   // pwm channel
+    E1: InputPin,           // input pin
+    E2: InputPin,           // input pin
 {
     // two PWM channels (A and B)
-    pwm_a: C1,
-    pwm_b: C2,
+    pwm: Slice<I, M>,
 
     // two encoders input pins
     pub enc_a: E1,
@@ -159,27 +162,28 @@ where
     speed_setpoint: f32,
 
     // bookeeping
-    duty_cycle: u16,
-    dir: WheelRotDir,
+    duty_cycle: u16,    // curr duty cycle
+    dir: WheelRotDir,   // curr direction
     speed_history: [f32; SPEED_HISTORY_LENGTH],
+
 
 }
 
-impl <C1, C2, E1, E2> Motor<C1, C2, E1, E2>
+impl <I, M, E1, E2> Motor<I, M, E1, E2>
 where
-    C1: SetDutyCycle,    // pwm channel
-    C2: SetDutyCycle,    // pwm channel
+    I: SliceId,         // pwm channel
+    M: ValidSliceMode<I>,  // pwm channel
     E1: InputPin,        // input pin
     E2: InputPin,        // input pin
 {
     /// Create a motor driver instance and configure pins accordingly
     pub fn new(
-        pwm_a: C1, pwm_b: C2,
+        pwm: Slice<I, M>,
         enc_a: E1, enc_b: E2,
     ) -> Self {
         // Motor instance
         Motor {
-            pwm_a, pwm_b, enc_a, enc_b,
+            pwm, enc_a, enc_b,
             enc_state: EncState::A, // initialize some random state
             enc_ticks: 0,           // initial ticks is 0
             speed_setpoint: 0.0,   // initial speed setpoint is 0
@@ -190,8 +194,12 @@ where
     }
 
     /// Configures the motor to the right state and perihperal values
-    pub fn configure (mut self) -> Self {
-        // initialize encoder state
+    pub fn configure <P1: AnyPin, P2: AnyPin> (mut self, pin_a: P1, pin_b: P2) -> Self
+    where
+        P1::Id: ValidPwmOutputPin<I, A>,
+        P2::Id: ValidPwmOutputPin<I, B>,
+    {
+        // initialize encoder pins and state
         let (a, b) = self.read_encoder();
         self.enc_state = to_state(a, b);
 
@@ -199,9 +207,15 @@ where
         // info!("Max Allowed Duty A: {}", self.pwm_a.max_duty_cycle());
         // info!("Max Allowed Duty B: {}", self.pwm_b.max_duty_cycle());
 
-        // future work: setup pwm slices
-        //  for now motors don't share the same pwm slice :(
-        //  therefore we need to configure them in main
+        // setup pwm slices
+        self.pwm.set_ph_correct();
+        self.pwm.enable();
+        self.pwm.channel_a.output_to(pin_a);
+        self.pwm.channel_b.output_to(pin_b);
+        self.pwm.channel_a.set_inverted();
+        self.pwm.channel_b.set_inverted();
+
+        // this is cool
         self
     }
 
@@ -215,8 +229,8 @@ where
     ///     - false = CCW
     pub fn set_duty_percent(&mut self, duty_percent: u16, direction: WheelRotDir) -> Result<(), Infallible>{
         // we first scale the passed in duty (as percentage) based on the max duty
-        let max_duty_a = self.pwm_a.max_duty_cycle() as f32;
-        let max_duty_b = self.pwm_b.max_duty_cycle() as f32;
+        let max_duty_a = self.pwm.channel_a.max_duty_cycle() as f32;
+        let max_duty_b = self.pwm.channel_b.max_duty_cycle() as f32;
 
         // now assign the duty to each channel based on direction
         match direction {
@@ -225,16 +239,16 @@ where
                 let scaled_duty = ((duty_percent as f32 / 100f32) * max_duty_a as f32) as u16;
 
                 // rotate cw by setting channel a to duty speed and b to 0
-                self.pwm_a.set_duty_cycle(scaled_duty).unwrap();    // rp235x-hal always returns Ok(())
-                self.pwm_b.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
+                self.pwm.channel_a.set_duty_cycle(scaled_duty).unwrap();    // rp235x-hal always returns Ok(())
+                self.pwm.channel_b.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
             },
             WheelRotDir::CCW => {
                 // scale duty for B
                 let scaled_duty = ((duty_percent as f32 / 100f32) * max_duty_b as f32) as u16;
 
                 // rotate cw by setting channel a to duty speed and b to 0
-                self.pwm_a.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
-                self.pwm_b.set_duty_cycle(scaled_duty).unwrap();    // rp235x-hal always returns Ok(())
+                self.pwm.channel_a.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
+                self.pwm.channel_b.set_duty_cycle(scaled_duty).unwrap();    // rp235x-hal always returns Ok(())
             },
         }
 
@@ -250,13 +264,13 @@ where
         match direction {
             WheelRotDir::CW => {
                 // rotate cw by setting channel a to duty speed and b to 0
-                self.pwm_a.set_duty_cycle(duty).unwrap();    // rp235x-hal always returns Ok(())
-                self.pwm_b.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
+                self.pwm.channel_a.set_duty_cycle(duty).unwrap();    // rp235x-hal always returns Ok(())
+                self.pwm.channel_b.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
             },
             WheelRotDir::CCW => {
                 // rotate cw by setting channel a to duty speed and b to 0
-                self.pwm_a.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
-                self.pwm_b.set_duty_cycle(duty).unwrap();    // rp235x-hal always returns Ok(())
+                self.pwm.channel_a.set_duty_cycle(0).unwrap();        // rp235x-hal always returns Ok(())
+                self.pwm.channel_b.set_duty_cycle(duty).unwrap();    // rp235x-hal always returns Ok(())
             },
         }
 
@@ -264,8 +278,39 @@ where
     }
 
     pub fn stop(&mut self) {
-        self.pwm_a.set_duty_cycle(0).unwrap();
-        self.pwm_b.set_duty_cycle(0).unwrap();
+        self.pwm.channel_a.set_duty_cycle(0).unwrap();
+        self.pwm.channel_b.set_duty_cycle(0).unwrap();
+    }
+
+    // calibration routine to determine the best speed to duty factor
+    pub fn calibrate(&mut self) {
+        // 1. run wheels at multiple speed targets
+        // 2. use intial conversion estimate
+        //      - fixed
+        //      - random init
+        //      - contrained random init
+        // 3. obtain encoder readings (in cm/s)
+        // 4. calculate loss
+        //      - squared mean loss
+        //      - some other loss function?
+        // 5. adjust conversion constant based on loss
+        // 6. repeat until convergence or timeout
+        //      - number of cycles (arg vs fixed)
+        //
+        // For now we can model the conversion as:
+        //      (A * x) + B
+        //  A: speed_to_duty_factor
+        //  B: speed_to_duty_offset
+    }
+
+    // speed to duty converts (cm/s) into duty cycles
+    // this function uses pre-calibrated constants
+    fn speed_to_duty(&mut self, speed: f32) -> u16 {
+        0
+    }
+
+    fn duty_to_speed(&mut self, duty: u16) -> f32 {
+        0f32
     }
 
     pub fn set_speed_setpoint(&mut self, speed: f32) {
@@ -282,11 +327,9 @@ where
     }
 
     pub fn update_duty_to_setpoint(&mut self, delta: f32) -> f32{
-        // calculate motor's speed
-        let rotations = self.get_encoder_ticks(true) as f32 / (TICKS_PER_ROTATION * MOTOR_GEAR_RATIO);
-        let rotation_per_second = rotations / delta;
-        let curr_speed = rotation_per_second * 2.0 * PI * WHEEL_DIAMETER;
-        let weighted_speed = get_weighted_speed(&self.speed_history, &curr_speed);
+        // get motor speed (enable lpf)
+        let weighted_speed = self.get_encoder_speed(delta, true);
+
         // info!("Current Speed: {} | Setpoint {}", weighted_speed, self.speed_setpoint);
 
         // get correction as percentage and convert to decimal
@@ -314,6 +357,7 @@ where
             },
         };
 
+        // buffer for low pass filter
         self.push_speed_history(&weighted_speed);
 
         weighted_speed
@@ -357,6 +401,28 @@ where
 
     pub fn reset_encoder_ticks(&mut self) {
         self.enc_ticks = 0;
+    }
+
+    /// Converts encoder readings into speed
+    /// args:
+    ///     delta: time step
+    ///     lpf: low-pass filter enable
+    pub fn get_encoder_speed(&mut self, delta: f32, lpf: bool) -> f32 {
+        // result
+        let res: f32;
+
+        // calculate motor's speed
+        let rotations = self.get_encoder_ticks(true) as f32 / (TICKS_PER_ROTATION * MOTOR_GEAR_RATIO);
+        let rot_per_sec = rotations / delta;
+        let speed = rot_per_sec * 2.0 * PI * WHEEL_DIAMETER;
+
+        if lpf {
+            res = get_weighted_speed(&self.speed_history, &speed);
+        } else {
+            res = speed;
+        }
+
+        res
     }
 
     pub(crate) fn push_speed_history(&mut self, new_speed: &f32) {

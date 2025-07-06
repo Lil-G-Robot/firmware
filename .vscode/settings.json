@@ -1,0 +1,14 @@
+{
+    "rust-analyzer.cargo.target": "thumbv8m.main-none-eabihf",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.linkedProjects": [
+        "./Cargo.toml",
+        "./drivers/motion/Cargo.toml",
+        "./drivers/motor/Cargo.toml",
+    ],
+    "rust-analyzer.check.extraArgs": [
+        "--bins",
+        "--lib",
+        "--examples"
+    ]
+}
